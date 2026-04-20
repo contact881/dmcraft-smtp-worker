@@ -29,29 +29,41 @@ const PUSH_NOTIFY_TIMEOUT_MS = 5_000;
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
 
+const nullableOptString = z
+  .union([z.string(), z.null()])
+  .optional()
+  .transform((v) => (v === null ? undefined : v));
+
+const nullableOptStringOrArray = z
+  .union([z.string(), z.array(z.string()), z.null()])
+  .optional()
+  .transform((v) => (v === null ? undefined : v));
+
 const AttachmentRefSchema = z.object({
   filename: z.string(),
-  // Either inline content OR a storage reference
-  content_base64: z.string().optional(),
-  storage_bucket: z.string().optional(),
-  storage_path: z.string().optional(),
-  mime_type: z.string().optional(),
+  content_base64: nullableOptString,
+  storage_bucket: nullableOptString,
+  storage_path: nullableOptString,
+  mime_type: nullableOptString,
   size_bytes: z.number().optional(),
 });
 
 const SendPayloadSchema = z.object({
   to: z.union([z.string(), z.array(z.string())]),
-  cc: z.union([z.string(), z.array(z.string())]).optional(),
-  bcc: z.union([z.string(), z.array(z.string())]).optional(),
+  cc: nullableOptStringOrArray,
+  bcc: nullableOptStringOrArray,
   subject: z.string(),
-  html: z.string().optional(),
-  text: z.string().optional(),
-  body: z.string().optional(), // legacy alias
-  attachments: z.array(AttachmentRefSchema).optional(),
-  reply_to: z.string().optional(),
-  in_reply_to: z.string().optional(),
-  references: z.union([z.string(), z.array(z.string())]).optional(),
-  thread_id: z.string().optional(),
+  html: nullableOptString,
+  text: nullableOptString,
+  body: nullableOptString,
+  bodyType: nullableOptString,
+  fileId: nullableOptString,
+  attachments: z.array(AttachmentRefSchema).nullable().optional().transform((v) => v ?? undefined),
+  reply_to: nullableOptString,
+  in_reply_to: nullableOptString,
+  replyToEmailId: nullableOptString,
+  references: nullableOptStringOrArray,
+  thread_id: nullableOptString,
 }).passthrough();
 
 export type DraftRow = {
@@ -275,18 +287,15 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
   draftLog.info({ messageId }, "📤 Draft picked up");
 
   // 1. Validate payload
-  let payload: z.infer<typeof SendPayloadSchema>;
-  try {
-    payload = SendPayloadSchema.parse(draft.send_payload);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    draftLog.error({ err: msg }, "Invalid send_payload schema");
-    await supabase
-      .from("email_drafts")
-      .update({ retry_status: "failed", retry_error: `Payload invalido: ${msg}` })
-      .eq("id", draft.id);
-    return;
+let payload: z.infer<typeof SendPayloadSchema>;
+try {
+  payload = SendPayloadSchema.parse(draft.send_payload);
+
+  if (!payload.in_reply_to && payload.replyToEmailId) {
+    payload.in_reply_to = payload.replyToEmailId;
   }
+
+} catch (err) {
 
   // 2. Load account
   const { data: account, error: accountError } = await supabase
