@@ -29,24 +29,21 @@ const PUSH_NOTIFY_TIMEOUT_MS = 5_000;
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
 
-const nullableOptString = z
-  .union([z.string(), z.null()])
-  .optional()
-  .transform((v) => (v === null ? undefined : v));
+const AttachmentRefSchema = z.object({
+  filename: z.string(),
+  content_base64: z.string().optional(),
+  storage_bucket: z.string().optional(),
+  storage_path: z.string().optional(),
+  mime_type: z.string().optional(),
+  size_bytes: z.number().optional(),
+});
 
+// Helper: accept string | null | undefined → optional string (null treated as absent)
+const nullableOptString = z.union([z.string(), z.null()]).optional().transform((v) => v ?? undefined);
 const nullableOptStringOrArray = z
   .union([z.string(), z.array(z.string()), z.null()])
   .optional()
   .transform((v) => (v === null ? undefined : v));
-
-const AttachmentRefSchema = z.object({
-  filename: z.string(),
-  content_base64: nullableOptString,
-  storage_bucket: nullableOptString,
-  storage_path: nullableOptString,
-  mime_type: nullableOptString,
-  size_bytes: z.number().optional(),
-});
 
 const SendPayloadSchema = z.object({
   to: z.union([z.string(), z.array(z.string())]),
@@ -55,13 +52,13 @@ const SendPayloadSchema = z.object({
   subject: z.string(),
   html: nullableOptString,
   text: nullableOptString,
-  body: nullableOptString,
-  bodyType: nullableOptString,
-  fileId: nullableOptString,
+  body: nullableOptString,        // legacy alias for html
+  bodyType: nullableOptString,    // legacy field, ignored
+  fileId: nullableOptString,      // legacy field, ignored
   attachments: z.array(AttachmentRefSchema).nullable().optional().transform((v) => v ?? undefined),
   reply_to: nullableOptString,
   in_reply_to: nullableOptString,
-  replyToEmailId: nullableOptString,
+  replyToEmailId: nullableOptString, // legacy alias for in_reply_to
   references: nullableOptStringOrArray,
   thread_id: nullableOptString,
 }).passthrough();
@@ -83,11 +80,6 @@ function toArray(v: string | string[] | undefined): string[] {
   return v.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-/**
- * Deterministic SMTP Message-ID for a given draft.
- * Used both as the actual Message-ID header AND as `gmail_message_id` in DB.
- * Same draft → same ID → strong idempotency.
- */
 function deterministicMessageId(draftId: string): string {
   return `dmcraft-draft-${draftId}@dmcraft.local`;
 }
@@ -115,10 +107,6 @@ async function loadAttachmentBuffer(
   throw new Error(`Attachment ${ref.filename} has neither content_base64 nor storage reference`);
 }
 
-/**
- * Best-effort cleanup of attachment files in the outbox bucket.
- * Never throws — failure is logged and ignored (storage TTL job will sweep eventually).
- */
 async function cleanupAttachments(
   refs: z.infer<typeof AttachmentRefSchema>[],
   log: Logger,
@@ -142,10 +130,6 @@ async function cleanupAttachments(
   }
 }
 
-/**
- * Best-effort push notification with hard timeout.
- * Never blocks the main flow — wrapped in try/catch + AbortController.
- */
 async function safePushNotify(
   payload: { userId: string; title: string; body: string; url?: string; type?: string },
   log: Logger,
@@ -219,7 +203,7 @@ async function scheduleRetry(draft: DraftRow, errorMsg: string, log: Logger) {
     .eq("id", draft.id);
 }
 
-// ─── Persistence (used by both happy path AND idempotent recovery) ──────────
+// ─── Persistence ────────────────────────────────────────────────────────────
 
 async function persistEmailRow(
   draft: DraftRow,
@@ -234,7 +218,6 @@ async function persistEmailRow(
 ): Promise<{ id: string } | null> {
   const supabase = getSupabase();
 
-  // Idempotency check: did we already insert this email in a previous run?
   const { data: existing } = await supabase
     .from("emails")
     .select("id")
@@ -287,15 +270,23 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
   draftLog.info({ messageId }, "📤 Draft picked up");
 
   // 1. Validate payload
-let payload: z.infer<typeof SendPayloadSchema>;
-try {
-  payload = SendPayloadSchema.parse(draft.send_payload);
-
-  if (!payload.in_reply_to && payload.replyToEmailId) {
-    payload.in_reply_to = payload.replyToEmailId;
+  let payload: z.infer<typeof SendPayloadSchema>;
+  try {
+    payload = SendPayloadSchema.parse(draft.send_payload);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    draftLog.error({ err: msg }, "Invalid send_payload schema");
+    await supabase
+      .from("email_drafts")
+      .update({ retry_status: "failed", retry_error: `Payload invalido: ${msg}` })
+      .eq("id", draft.id);
+    return;
   }
 
-} catch (err) {
+  // Legacy alias: replyToEmailId → in_reply_to
+  if (!payload.in_reply_to && (payload as any).replyToEmailId) {
+    payload.in_reply_to = (payload as any).replyToEmailId as string;
+  }
 
   // 2. Load account
   const { data: account, error: accountError } = await supabase
@@ -335,9 +326,6 @@ try {
   const attachmentRefs = payload.attachments || [];
 
   // ─── IDEMPOTENT RECOVERY ──────────────────────────────────────────────────
-  // If an `emails` row with our deterministic Message-ID already exists,
-  // SMTP was already delivered in a previous run that crashed before
-  // finishing persistence/cleanup. Skip the send, finalize cleanup, exit.
   const { data: alreadySent } = await supabase
     .from("emails")
     .select("id")
@@ -422,7 +410,7 @@ try {
       replyTo: payload.reply_to,
       inReplyTo: payload.in_reply_to,
       references: payload.references,
-      messageId, // ← Deterministic ID = strong idempotency
+      messageId,
       headers: { "X-DMCraft-Draft-ID": draft.id },
       attachments: mailAttachments.length ? mailAttachments : undefined,
     });
@@ -451,8 +439,6 @@ try {
   );
 
   if (!emailRow) {
-    // SMTP succeeded but DB insert failed — leave draft for next cycle.
-    // Idempotency guard at top will prevent double SMTP send.
     draftLog.error("⚠️ Email sent but DB persistence failed — will retry persistence next cycle");
     await supabase
       .from("email_drafts")
