@@ -31,6 +31,7 @@ const PUSH_NOTIFY_TIMEOUT_MS = 5_000;
 
 const AttachmentRefSchema = z.object({
   filename: z.string(),
+  // Either inline content OR a storage reference
   content_base64: z.string().optional(),
   storage_bucket: z.string().optional(),
   storage_path: z.string().optional(),
@@ -39,29 +40,39 @@ const AttachmentRefSchema = z.object({
 });
 
 // Helper: accept string | null | undefined → optional string (null treated as absent)
-const nullableOptString = z.union([z.string(), z.null()]).optional().transform((v) => v ?? undefined);
+const nullableOptString = z
+  .union([z.string(), z.null()])
+  .optional()
+  .transform((v) => v ?? undefined);
+
 const nullableOptStringOrArray = z
   .union([z.string(), z.array(z.string()), z.null()])
   .optional()
   .transform((v) => (v === null ? undefined : v));
 
-const SendPayloadSchema = z.object({
-  to: z.union([z.string(), z.array(z.string())]),
-  cc: nullableOptStringOrArray,
-  bcc: nullableOptStringOrArray,
-  subject: z.string(),
-  html: nullableOptString,
-  text: nullableOptString,
-  body: nullableOptString,        // legacy alias for html
-  bodyType: nullableOptString,    // legacy field, ignored
-  fileId: nullableOptString,      // legacy field, ignored
-  attachments: z.array(AttachmentRefSchema).nullable().optional().transform((v) => v ?? undefined),
-  reply_to: nullableOptString,
-  in_reply_to: nullableOptString,
-  replyToEmailId: nullableOptString, // legacy alias for in_reply_to
-  references: nullableOptStringOrArray,
-  thread_id: nullableOptString,
-}).passthrough();
+const SendPayloadSchema = z
+  .object({
+    to: z.union([z.string(), z.array(z.string())]),
+    cc: nullableOptStringOrArray,
+    bcc: nullableOptStringOrArray,
+    subject: z.string(),
+    html: nullableOptString,
+    text: nullableOptString,
+    body: nullableOptString, // legacy alias for html
+    bodyType: nullableOptString, // legacy field, ignored
+    fileId: nullableOptString, // legacy field, ignored
+    attachments: z
+      .array(AttachmentRefSchema)
+      .nullable()
+      .optional()
+      .transform((v) => v ?? undefined),
+    reply_to: nullableOptString,
+    in_reply_to: nullableOptString,
+    replyToEmailId: nullableOptString, // legacy alias for in_reply_to
+    references: nullableOptStringOrArray,
+    thread_id: nullableOptString,
+  })
+  .passthrough();
 
 export type DraftRow = {
   id: string;
@@ -77,9 +88,17 @@ export type DraftRow = {
 function toArray(v: string | string[] | undefined): string[] {
   if (!v) return [];
   if (Array.isArray(v)) return v.filter(Boolean);
-  return v.split(",").map((s) => s.trim()).filter(Boolean);
+  return v
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
+/**
+ * Deterministic SMTP Message-ID for a given draft.
+ * Used both as the actual Message-ID header AND as `gmail_message_id` in DB.
+ * Same draft → same ID → strong idempotency.
+ */
 function deterministicMessageId(draftId: string): string {
   return `dmcraft-draft-${draftId}@dmcraft.local`;
 }
@@ -91,22 +110,32 @@ async function loadAttachmentBuffer(
   if (ref.content_base64) {
     return Buffer.from(ref.content_base64.replace(/\s/g, ""), "base64");
   }
+
   if (ref.storage_bucket && ref.storage_path) {
     const supabase = getSupabase();
     const { data, error } = await supabase.storage
       .from(ref.storage_bucket)
       .download(ref.storage_path);
+
     if (error || !data) {
       throw new Error(
         `Failed to download attachment ${ref.filename} from ${ref.storage_bucket}/${ref.storage_path}: ${error?.message}`,
       );
     }
+
     const arrayBuffer = await data.arrayBuffer();
     return Buffer.from(arrayBuffer);
   }
-  throw new Error(`Attachment ${ref.filename} has neither content_base64 nor storage reference`);
+
+  throw new Error(
+    `Attachment ${ref.filename} has neither content_base64 nor storage reference`,
+  );
 }
 
+/**
+ * Best-effort cleanup of attachment files in the outbox bucket.
+ * Never throws — failure is logged and ignored (storage TTL job will sweep eventually).
+ */
 async function cleanupAttachments(
   refs: z.infer<typeof AttachmentRefSchema>[],
   log: Logger,
@@ -119,25 +148,46 @@ async function cleanupAttachments(
 
   try {
     const supabase = getSupabase();
-    const { error } = await supabase.storage.from(ATTACHMENTS_BUCKET).remove(toDelete);
+    const { error } = await supabase.storage
+      .from(ATTACHMENTS_BUCKET)
+      .remove(toDelete);
+
     if (error) {
-      log.warn({ err: error.message, count: toDelete.length }, "Attachment cleanup failed (non-fatal)");
+      log.warn(
+        { err: error.message, count: toDelete.length },
+        "Attachment cleanup failed (non-fatal)",
+      );
     } else {
-      log.debug({ count: toDelete.length }, "Attachment files cleaned from storage");
+      log.debug(
+        { count: toDelete.length },
+        "Attachment files cleaned from storage",
+      );
     }
   } catch (err) {
     log.warn({ err }, "Attachment cleanup exception (non-fatal)");
   }
 }
 
+/**
+ * Best-effort push notification with hard timeout.
+ * Never blocks the main flow — wrapped in try/catch + AbortController.
+ */
 async function safePushNotify(
-  payload: { userId: string; title: string; body: string; url?: string; type?: string },
+  payload: {
+    userId: string;
+    title: string;
+    body: string;
+    url?: string;
+    type?: string;
+  },
   log: Logger,
 ) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PUSH_NOTIFY_TIMEOUT_MS);
+
   try {
     const supabase = getSupabase();
+
     await Promise.race([
       supabase.functions.invoke("push-notify", {
         body: { action: "send", ...payload },
@@ -149,7 +199,10 @@ async function safePushNotify(
       ),
     ]);
   } catch (e) {
-    log.warn({ err: e instanceof Error ? e.message : String(e) }, "push-notify failed (non-fatal)");
+    log.warn(
+      { err: e instanceof Error ? e.message : String(e) },
+      "push-notify failed (non-fatal)",
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -162,7 +215,11 @@ async function scheduleRetry(draft: DraftRow, errorMsg: string, log: Logger) {
   const newRetryCount = (draft.retry_count || 0) + 1;
 
   if (newRetryCount >= MAX_RETRIES) {
-    log.error({ draftId: draft.id, errorMsg, attempts: newRetryCount }, "Draft failed permanently");
+    log.error(
+      { draftId: draft.id, errorMsg, attempts: newRetryCount },
+      "Draft failed permanently",
+    );
+
     await supabase
       .from("email_drafts")
       .update({
@@ -182,11 +239,13 @@ async function scheduleRetry(draft: DraftRow, errorMsg: string, log: Logger) {
       },
       log,
     );
+
     return;
   }
 
   const minutes = BACKOFF_MINUTES[newRetryCount - 1] || 10;
   const nextRetry = new Date(Date.now() + minutes * 60_000).toISOString();
+
   log.warn(
     { draftId: draft.id, attempt: newRetryCount, nextRetry, errorMsg },
     "Retry scheduled",
@@ -203,7 +262,7 @@ async function scheduleRetry(draft: DraftRow, errorMsg: string, log: Logger) {
     .eq("id", draft.id);
 }
 
-// ─── Persistence ────────────────────────────────────────────────────────────
+// ─── Persistence (used by both happy path AND idempotent recovery) ──────────
 
 async function persistEmailRow(
   draft: DraftRow,
@@ -218,6 +277,7 @@ async function persistEmailRow(
 ): Promise<{ id: string } | null> {
   const supabase = getSupabase();
 
+  // Idempotency check: did we already insert this email in a previous run?
   const { data: existing } = await supabase
     .from("emails")
     .select("id")
@@ -226,7 +286,10 @@ async function persistEmailRow(
     .maybeSingle();
 
   if (existing?.id) {
-    log.info({ emailId: existing.id }, "♻️  Email row already exists (idempotent recovery)");
+    log.info(
+      { emailId: existing.id },
+      "♻️  Email row already exists (idempotent recovery)",
+    );
     return existing;
   }
 
@@ -257,12 +320,16 @@ async function persistEmailRow(
     log.error({ err: error?.message }, "Email row insert failed");
     return null;
   }
+
   return emailRow;
 }
 
 // ─── Main entry ─────────────────────────────────────────────────────────────
 
-export async function processDraft(draft: DraftRow, log: Logger): Promise<void> {
+export async function processDraft(
+  draft: DraftRow,
+  log: Logger,
+): Promise<void> {
   const supabase = getSupabase();
   const draftLog = log.child({ draftId: draft.id, accountId: draft.account_id });
   const messageId = deterministicMessageId(draft.id);
@@ -271,21 +338,27 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
 
   // 1. Validate payload
   let payload: z.infer<typeof SendPayloadSchema>;
+
   try {
     payload = SendPayloadSchema.parse(draft.send_payload);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     draftLog.error({ err: msg }, "Invalid send_payload schema");
+
     await supabase
       .from("email_drafts")
-      .update({ retry_status: "failed", retry_error: `Payload invalido: ${msg}` })
+      .update({
+        retry_status: "failed",
+        retry_error: `Payload invalido: ${msg}`,
+      })
       .eq("id", draft.id);
+
     return;
   }
 
   // Legacy alias: replyToEmailId → in_reply_to
-  if (!payload.in_reply_to && (payload as any).replyToEmailId) {
-    payload.in_reply_to = (payload as any).replyToEmailId as string;
+  if (!payload.in_reply_to && payload.replyToEmailId) {
+    payload.in_reply_to = payload.replyToEmailId;
   }
 
   // 2. Load account
@@ -298,21 +371,37 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
     .maybeSingle();
 
   if (accountError || !account) {
-    await scheduleRetry(draft, `Account non trovato: ${accountError?.message || "n/a"}`, draftLog);
+    await scheduleRetry(
+      draft,
+      `Account non trovato: ${accountError?.message || "n/a"}`,
+      draftLog,
+    );
     return;
   }
 
   if (account.status !== "active") {
-    draftLog.error({ status: account.status }, "Account not active, marking failed");
+    draftLog.error(
+      { status: account.status },
+      "Account not active, marking failed",
+    );
+
     await supabase
       .from("email_drafts")
-      .update({ retry_status: "failed", retry_error: `Account non attivo: ${account.status}` })
+      .update({
+        retry_status: "failed",
+        retry_error: `Account non attivo: ${account.status}`,
+      })
       .eq("id", draft.id);
+
     return;
   }
 
   if (!account.smtp_host || !account.smtp_port || !account.smtp_password_encrypted) {
-    await scheduleRetry(draft, "Configurazione SMTP incompleta sull'account", draftLog);
+    await scheduleRetry(
+      draft,
+      "Configurazione SMTP incompleta sull'account",
+      draftLog,
+    );
     return;
   }
 
@@ -326,6 +415,9 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
   const attachmentRefs = payload.attachments || [];
 
   // ─── IDEMPOTENT RECOVERY ──────────────────────────────────────────────────
+  // If an `emails` row with our deterministic Message-ID already exists,
+  // SMTP was already delivered in a previous run that crashed before
+  // finishing persistence/cleanup. Skip the send, finalize cleanup, exit.
   const { data: alreadySent } = await supabase
     .from("emails")
     .select("id")
@@ -338,6 +430,7 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
       { emailId: alreadySent.id },
       "♻️  Idempotent recovery: SMTP was already delivered in a previous run, finalizing cleanup",
     );
+
     await cleanupAttachments(attachmentRefs, draftLog);
     await supabase.from("email_drafts").delete().eq("id", draft.id);
     return;
@@ -345,36 +438,62 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
 
   // 3. Decrypt SMTP password
   let smtpPassword: string;
+
   try {
     smtpPassword = await decryptToken(account.smtp_password_encrypted);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     draftLog.error({ err: msg }, "Failed to decrypt SMTP password");
-    await scheduleRetry(draft, `Errore decrittazione password SMTP: ${msg}`, draftLog);
+    await scheduleRetry(
+      draft,
+      `Errore decrittazione password SMTP: ${msg}`,
+      draftLog,
+    );
     return;
   }
 
   // 4. Build attachments
-  const mailAttachments: { filename: string; content: Buffer; contentType?: string }[] = [];
-  const persistedAttachmentMeta: { filename: string; mime_type?: string; size_bytes: number; storage_path?: string }[] = [];
+  const mailAttachments: {
+    filename: string;
+    content: Buffer;
+    contentType?: string;
+  }[] = [];
+
+  const persistedAttachmentMeta: {
+    filename: string;
+    mime_type?: string;
+    size_bytes: number;
+    storage_path?: string;
+  }[] = [];
 
   for (const ref of attachmentRefs) {
     try {
       const buf = await loadAttachmentBuffer(ref, draftLog);
-      mailAttachments.push({ filename: ref.filename, content: buf, contentType: ref.mime_type });
+
+      mailAttachments.push({
+        filename: ref.filename,
+        content: buf,
+        contentType: ref.mime_type,
+      });
+
       persistedAttachmentMeta.push({
         filename: ref.filename,
         mime_type: ref.mime_type,
         size_bytes: buf.byteLength,
         storage_path: ref.storage_path,
       });
+
       draftLog.info(
         { filename: ref.filename, sizeKB: Math.round(buf.byteLength / 1024) },
         "Attachment loaded",
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await scheduleRetry(draft, `Errore caricamento allegato ${ref.filename}: ${msg}`, draftLog);
+      await scheduleRetry(
+        draft,
+        `Errore caricamento allegato ${ref.filename}: ${msg}`,
+        draftLog,
+      );
       return;
     }
   }
@@ -382,6 +501,7 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
   // 5. SMTP connect + send
   const port = Number(account.smtp_port);
   const useTls = account.smtp_use_tls !== false;
+
   const transporter = nodemailer.createTransport({
     host: account.smtp_host,
     port,
@@ -421,8 +541,8 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
     await scheduleRetry(draft, msg, draftLog);
     return;
   }
-  transporter.close();
 
+  transporter.close();
   draftLog.info({ messageId }, "✅ SMTP delivered");
 
   // 6. Persist email + attachments (idempotent)
@@ -439,7 +559,12 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
   );
 
   if (!emailRow) {
-    draftLog.error("⚠️ Email sent but DB persistence failed — will retry persistence next cycle");
+    // SMTP succeeded but DB insert failed — leave draft for next cycle.
+    // Idempotency guard at top will prevent double SMTP send.
+    draftLog.error(
+      "⚠️ Email sent but DB persistence failed — will retry persistence next cycle",
+    );
+
     await supabase
       .from("email_drafts")
       .update({
@@ -448,6 +573,7 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
         retry_error: "SMTP OK ma errore salvataggio DB — verrà riprovato",
       })
       .eq("id", draft.id);
+
     return;
   }
 
@@ -461,9 +587,16 @@ export async function processDraft(draft: DraftRow, log: Logger): Promise<void> 
       storage_path: a.storage_path || null,
       gmail_attachment_id: `${messageId}-${idx}`,
     }));
-    const { error: attErr } = await supabase.from("email_attachments").insert(rows);
+
+    const { error: attErr } = await supabase
+      .from("email_attachments")
+      .insert(rows);
+
     if (attErr) {
-      draftLog.warn({ err: attErr.message }, "Attachment metadata insert failed (non-fatal)");
+      draftLog.warn(
+        { err: attErr.message },
+        "Attachment metadata insert failed (non-fatal)",
+      );
     }
   }
 
